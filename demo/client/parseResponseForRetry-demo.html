@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>parseResponseForRetry Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        button {
+            margin: 10px;
+            padding: 10px 20px;
+            font-size: 16px;
+        }
+
+        .success {
+            background-color: #4CAF50;
+            color: white;
+        }
+
+        .retry {
+            background-color: #ff9800;
+            color: white;
+        }
+
+        .error {
+            background-color: #f44336;
+            color: white;
+        }
+
+        .warning {
+            background-color: #fd7e14;
+            color: white;
+        }
+
+        #logs {
+            background: #f5f5f5;
+            padding: 10px;
+            margin: 20px 0;
+            height: 300px;
+            overflow-y: auto;
+        }
+
+        pre {
+            margin: 0;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>parseResponseForRetry Demo</h1>
+    <p>This demo shows how <code>parseResponseForRetry</code> handles partial failures with originalData preservation.
+    </p>
+
+    <button id="test-partial-retry" class="retry">Test Partial Retry</button>
+    <button id="test-all-success" class="success">Test All Success</button>
+    <button id="test-all-failure" class="error">Test All Non-Retryable</button>
+    <button id="test-server-error" class="error">Test Server Error (IndexedDB)</button>
+    <button id="test-exhaust-retry" class="error">Test Exhaust Retries (IndexedDB)</button>
+    <button id="test-success-on-third" class="retry">Test Success on 3rd Persistence</button>
+    <button id="test-direct-persist" class="warning">Test Direct to IndexedDB (No In-Memory)</button>
+    <button id="clear-logs">Clear Logs</button>
+    <button id="clear-db">Clear IndexedDB</button>
+    <button id="reset-server">Reset Server Counters</button>
+
+    <div id="logs"></div>
+
+    <script type="module" src="/dist/bundle.esm.js"></script>
+    <script type="module">
+        import { createBeacon } from '/dist/bundle.esm.js';
+
+        window.__DEBUG_BEACON_TRANSPORTER = true;
+        console.log('Debug flag set:', window.__DEBUG_BEACON_TRANSPORTER);
+
+        const logs = document.getElementById('logs');
+
+        function log(message) {
+            const timestamp = new Date().toLocaleTimeString();
+            logs.innerHTML += `<pre>[${timestamp}] ${message}</pre>`;
+            logs.scrollTop = logs.scrollHeight;
+        }
+
+        // Track requests for logging
+        let requestCount = 0;
+
+        console.log('Creating beacon...');
+        const { beacon, database } = createBeacon({
+            inMemoryRetry: {
+                attemptLimit: 2, // Reduce to 2 so we can test exhaustion faster
+                statusCodes: [502, 503], // Keep 500 out for direct IndexedDB
+                calculateRetryDelay: () => 500, // Faster retry for demo
+            },
+            persistenceRetry: {
+                idbName: 'parseResponseForRetry-demo',
+                attemptLimit: 3,
+                maxNumber: 10,
+                batchEvictionNumber: 3,
+                throttleWait: 10000, // 10 seconds for retry
+                useIdle: false, // Don't wait for idle time - retry immediately
+                statusCodes: [429, 500, 503], // Add 500 to trigger IndexedDB storage
+            },
+            parseResponseForRetry: (responseBody, originalPayload) => {
+                try {
+                    const response = JSON.parse(responseBody);
+                    const originalData = JSON.parse(originalPayload);
+
+                    log(`🔍 parseResponseForRetry called:`);
+                    log(`   Original payload: ${originalPayload}`);
+                    log(`   Response: ${responseBody}`);
+
+                    // Find items that need retry based on response status
+                    const retryableItemIds = response.responses
+                        ?.filter(item => item.responseStatus === "ResponseStatus_RETRYABLE_FAILURE")
+                        ?.map(item => item.id) || [];
+
+                    log(`   Retryable item IDs: [${retryableItemIds.join(', ')}]`);
+
+                    if (retryableItemIds.length > 0) {
+                        // Get the original items that need retry from originalData
+                        const itemsToRetry = originalData.items?.filter(originalItem =>
+                            retryableItemIds.includes(originalItem.id)
+                        ) || [];
+
+                        if (itemsToRetry.length > 0) {
+                            const retryPayload = JSON.stringify({ items: itemsToRetry });
+                            log(`✅ Retry payload: ${retryPayload}`);
+                            return retryPayload;
+                        }
+                    }
+
+                    log(`❌ No retry needed`);
+                    return null; // No retry needed
+                } catch (error) {
+                    log(`🚨 parseResponseForRetry error: ${error.message}`);
+                    return null;
+                }
+            }
+        });
+
+        console.log('Beacon created successfully:', { beacon, database });
+        log('✅ Beacon initialized successfully');
+
+        // Create a second beacon with disabled in-memory retry for direct-to-IndexedDB testing
+        console.log('Creating direct-persist beacon...');
+        const { beacon: directBeacon, database: directDatabase } = createBeacon({
+            inMemoryRetry: {
+                attemptLimit: 0, // Disable in-memory retries
+                statusCodes: [500, 502, 503],
+                calculateRetryDelay: () => 500
+            },
+            persistenceRetry: {
+                idbName: 'direct-persist-demo',
+                attemptLimit: 3,
+                maxNumber: 10,
+                batchEvictionNumber: 3,
+                throttleWait: 10000, // 10 seconds for retry
+                useIdle: false,
+                statusCodes: [429, 500, 503],
+            },
+            parseResponseForRetry: (responseBody, originalPayload) => {
+                try {
+                    const response = JSON.parse(responseBody);
+                    const originalData = JSON.parse(originalPayload);
+
+                    log(`🔍 directBeacon parseResponseForRetry called:`);
+                    log(`   Original payload: ${originalPayload}`);
+                    log(`   Response: ${responseBody}`);
+
+                    // Find items that need retry based on response status
+                    const retryableItemIds = response.responses
+                        ?.filter(item => item.responseStatus === "ResponseStatus_RETRYABLE_FAILURE")
+                        ?.map(item => item.id) || [];
+
+                    log(`   Retryable item IDs: [${retryableItemIds.join(', ')}]`);
+
+                    if (retryableItemIds.length > 0) {
+                        // Get the original items that need retry from originalData
+                        const itemsToRetry = originalData.items?.filter(originalItem =>
+                            retryableItemIds.includes(originalItem.id)
+                        ) || [];
+
+                        if (itemsToRetry.length > 0) {
+                            const retryPayload = JSON.stringify({ items: itemsToRetry });
+                            log(`✅ Direct beacon retry payload: ${retryPayload}`);
+                            return retryPayload;
+                        }
+                    }
+
+                    log(`❌ No retry needed for direct beacon`);
+                    return null; // No retry needed
+                } catch (error) {
+                    log(`🚨 directBeacon parseResponseForRetry error: ${error.message}`);
+                    return null;
+                }
+            }
+        });
+
+        console.log('Direct beacon created successfully:', { directBeacon, directDatabase });
+        log('✅ Direct-persist beacon initialized (attemptLimit: 0)');
+
+        // Helper function to reset server counters
+        async function resetServerCounters() {
+            try {
+                await fetch('/api/reset', { method: 'POST' });
+                log('🔄 Server counters reset');
+            } catch (error) {
+                log(`⚠️ Failed to reset server counters: ${error.message}`);
+            }
+        }
+
+        // Test scenarios
+        document.getElementById('test-partial-retry').addEventListener('click', async () => {
+            requestCount = 0;
+            await resetServerCounters();
+            log('🚀 Starting Partial Retry Test (will test IndexedDB persistence)...');
+            log('💡 First request: mixed success/failure, then retries will exhaust and persist to IndexedDB');
+
+            try {
+                const result = await beacon('/api/partial-retry', JSON.stringify({
+                    items: [
+                        { id: "item1", data: "success_data", timestamp: Date.now() },
+                        { id: "item2", data: "retry_data", timestamp: Date.now() },
+                        { id: "item3", data: "fail_data", timestamp: Date.now() }
+                    ]
+                }));
+
+                if (result.drop) {
+                    log('💾 ✅ Partial retry request stored in IndexedDB! Check DevTools > Application > IndexedDB');
+                    log('⏰ Waiting 10 seconds before retry...');
+
+                    // Set up a timer to check if retry happens
+                    setTimeout(() => {
+                        log('⏰ 10 seconds passed - retry should have happened by now');
+                        log('🔍 Check console for [beacon-transporter] debug logs');
+                    }, 11000);
+                }
+
+                log(`✅ Final result: ${JSON.stringify(result)}`);
+            } catch (error) {
+                log(`🚨 Error: ${error.message}`);
+            }
+        });
+
+        document.getElementById('test-all-success').addEventListener('click', async () => {
+            requestCount = 0;
+            log('🚀 Starting All Success Test...');
+
+            try {
+                const result = await beacon('/api/all-success', JSON.stringify({
+                    items: [
+                        { id: "item1", data: "success_data_1" },
+                        { id: "item2", data: "success_data_2" },
+                        { id: "item3", data: "success_data_3" }
+                    ]
+                }));
+                log(`✅ Final result: ${JSON.stringify(result)}`);
+            } catch (error) {
+                log(`🚨 Error: ${error.message}`);
+            }
+        });
+
+        document.getElementById('test-all-failure').addEventListener('click', async () => {
+            requestCount = 0;
+            log('🚀 Starting All Non-Retryable Failure Test...');
+
+            try {
+                const result = await beacon('/api/all-non-retryable', JSON.stringify({
+                    items: [
+                        { id: "item1", data: "failure_data_1" },
+                        { id: "item2", data: "failure_data_2" },
+                        { id: "item3", data: "failure_data_3" }
+                    ]
+                }));
+                log(`✅ Final result: ${JSON.stringify(result)}`);
+            } catch (error) {
+                log(`🚨 Error: ${error.message}`);
+            }
+        });
+
+        document.getElementById('test-server-error').addEventListener('click', async () => {
+            requestCount = 0;
+            log('🚀 Starting Server Error Test (will trigger IndexedDB persistence)...');
+            log('💾 Watch for "drop":true in result - this means stored in IndexedDB');
+            log('🕐 After storage, beacon will wait 10 seconds before retry');
+
+            try {
+                const result = await beacon('/api/server-error', JSON.stringify({
+                    items: [
+                        { id: "error1", data: "will_fail_data", timestamp: Date.now() },
+                        { id: "error2", data: "also_fail_data", timestamp: Date.now() }
+                    ]
+                }));
+
+                if (result.drop) {
+                    log('💾 ✅ Request stored in IndexedDB! Check DevTools > Application > IndexedDB');
+                    log('⏰ Waiting 10 seconds before retry...');
+
+                    // Set up a timer to check if retry happens
+                    setTimeout(() => {
+                        log('⏰ 10 seconds passed - retry should have happened by now');
+                        log('🔍 Check console for [beacon-transporter] debug logs');
+                    }, 11000);
+                }
+
+                log(`✅ Final result: ${JSON.stringify(result)}`);
+            } catch (error) {
+                log(`🚨 Error: ${error.message}`);
+            }
+        });
+
+        document.getElementById('test-exhaust-retry').addEventListener('click', async () => {
+            await resetServerCounters();
+            requestCount = 0;
+            log('🚀 Starting Exhaust Retries Test (will exhaust in-memory then use IndexedDB)...');
+            log('💡 This will fail 3 times in-memory, then store in IndexedDB for later retry');
+
+            try {
+                const result = await beacon('/api/exhaust-retry', JSON.stringify({
+                    items: [
+                        { id: "item1", data: "retry_data_1", timestamp: Date.now() },
+                        { id: "item2", data: "retry_data_2", timestamp: Date.now() }
+                    ]
+                }));
+                log(`✅ Final result: ${JSON.stringify(result)}`);
+            } catch (error) {
+                log(`🚨 Error: ${error.message}`);
+            }
+        });
+
+        document.getElementById('test-direct-persist').addEventListener('click', async () => {
+            requestCount = 0;
+            await resetServerCounters();
+            log('🚀 Starting Direct-to-IndexedDB Test (No In-Memory Retry)...');
+            log('💡 This beacon has attemptLimit: 0, so 500 errors go directly to IndexedDB');
+
+            try {
+                const result = await directBeacon('/api/direct-persist', JSON.stringify({
+                    items: [
+                        { id: "direct1", data: "direct_data_1", timestamp: Date.now() },
+                        { id: "direct2", data: "direct_data_2", timestamp: Date.now() }
+                    ]
+                }));
+
+                if (result.drop) {
+                    log('💾 ✅ Request stored directly in IndexedDB! Check DevTools > Application > IndexedDB > direct-persist-demo');
+                    log('⏰ Waiting 5 seconds before retry...');
+
+                    // Set up a timer to check if retry happens
+                    setTimeout(() => {
+                        log('⏰ 5 seconds passed - retry should have happened by now');
+                        log('🔍 Check console for [beacon-transporter] debug logs');
+                    }, 6000);
+                }
+
+                log(`✅ Final result: ${JSON.stringify(result)}`);
+            } catch (error) {
+                log(`🚨 Error: ${error.message}`);
+            }
+        });
+
+        document.getElementById('test-success-on-third').addEventListener('click', async () => {
+            requestCount = 0;
+            await resetServerCounters();
+            log('🚀 Starting Success on 3rd Persistence Test...');
+            log('📋 This will: 3 in-memory retries → 2 persistence failures → SUCCESS on 3rd persistence');
+
+            try {
+                const result = await beacon('/api/success-on-third-persistence', JSON.stringify({
+                    items: [
+                        { id: "item1", data: "success_data", timestamp: Date.now() },
+                        { id: "item2", data: "retry_data", timestamp: Date.now() },
+                        { id: "item3", data: "fail_data", timestamp: Date.now() }
+                    ]
+                }));
+
+                if (result.drop) {
+                    log('💾 ✅ Request stored in IndexedDB after in-memory exhaustion!');
+                    log('⏰ Watch for persistence retries: attemptCount 0 → 1 → 2 → SUCCESS');
+                    log('🔍 Check console for [PERSISTENCE] debug logs');
+                }
+
+                log(`✅ Final result: ${JSON.stringify(result)}`);
+            } catch (error) {
+                log(`🚨 Error: ${error.message}`);
+            }
+        });
+
+        document.getElementById('clear-logs').addEventListener('click', () => {
+            logs.innerHTML = '';
+        });
+
+        document.getElementById('clear-db').addEventListener('click', async () => {
+            try {
+                await database.clearQueue();
+                await directDatabase.clearQueue();
+                log('🗑️ Both IndexedDB databases cleared successfully');
+            } catch (error) {
+                log(`🚨 Error clearing IndexedDB: ${error.message}`);
+            }
+        });
+
+        document.getElementById('reset-server').addEventListener('click', async () => {
+            await resetServerCounters();
+        });
+
+        log('📋 Demo ready! Click the buttons to test different scenarios.');
+        log('💡 Use "Test Server Error" to see IndexedDB persistence in action!');
+        log('🎯 Try "Test Success on 3rd Persistence" to see the full retry cycle!');
+        log('🔍 Check DevTools > Application > IndexedDB to see the database.');
+    </script>
+</body>
+
+</html>

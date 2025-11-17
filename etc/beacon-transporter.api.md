@@ -24,6 +24,8 @@ export interface BeaconInit<CustomRetryDB = IRetryDBBase> {
         onIntermediateResult?: (result: RequestResult, rawPayload: string) => void;
     };
     // (undocumented)
+    parseResponseForRetry?: (responseBody: string, originalPayload: string) => string | null;
+    // (undocumented)
     persistenceRetry?: {
         idbName?: string;
         attemptLimit?: number;
@@ -132,6 +134,8 @@ export interface RequestResponseUnknown {
     // (undocumented)
     drop: boolean;
     // (undocumented)
+    responseBody?: string;
+    // (undocumented)
     statusCode?: undefined;
     // (undocumented)
     type: 'unknown';
@@ -144,6 +148,8 @@ export type RequestResult = RequestSuccess | RequestPersisted | RequestNetworkEr
 export interface RequestSuccess {
     // (undocumented)
     drop: false;
+    // (undocumented)
+    responseBody?: string;
     // (undocumented)
     statusCode: number;
     // (undocumented)
@@ -158,7 +164,9 @@ export type RequiredInMemoryRetryConfig = Required<Pick<NonNullable<BeaconInit['
 // Warning: (ae-internal-missing-underscore) The name "RequiredPersistenceRetryConfig" should be prefixed with an underscore because the declaration is marked as @internal
 //
 // @internal (undocumented)
-export type RequiredPersistenceRetryConfig = Required<Pick<NonNullable<BeaconInit['persistenceRetry']>, 'idbName' | 'attemptLimit' | 'statusCodes' | 'maxNumber' | 'batchEvictionNumber' | 'throttleWait'>> & NonNullable<BeaconInit['persistenceRetry']>;
+export type RequiredPersistenceRetryConfig = Required<Pick<NonNullable<BeaconInit['persistenceRetry']>, 'idbName' | 'attemptLimit' | 'statusCodes' | 'maxNumber' | 'batchEvictionNumber' | 'throttleWait'>> & NonNullable<BeaconInit['persistenceRetry']> & {
+    parseResponseForRetry?: (responseBody: string, originalPayload: string) => string | null;
+};
 
 // @public (undocumented)
 export class RetryDB implements IRetryDB {

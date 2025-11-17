@@ -114,6 +114,7 @@ describe.each(browsers.map((t) => [t]))('[%s] beacon', (name) => {
         type: 'success',
         drop: false,
         statusCode: 200,
+        responseBody: 'hello',
       });
     }
     await waitForExpect(() => {
@@ -371,6 +372,340 @@ describe.each(browsers.map((t) => [t]))('[%s] beacon', (name) => {
     }
     // express knows gzip
     expect(requests[0].body).toBe('hi');
+  });
+
+  it('should handle partial retry with parseResponseForRetry function', async () => {
+    const requests = [];
+    let callCount = 0;
+
+    server.post('/api', (request, response) => {
+      callCount++;
+      requests.push({
+        body: request.body,
+        attempt: callCount,
+      });
+
+      if (callCount === 1) {
+        // First call - partial failure response (status 200 but with retry data)
+        response.status(200).json({
+          responses: [
+            {
+              id: "367",
+              responseStatus: "ResponseStatus_NON_RETRYABLE_FAILURE"
+            },
+            {
+              id: "368",
+              responseStatus: "ResponseStatus_RETRYABLE_FAILURE"
+            }
+          ]
+        });
+      } else {
+        // Second call - complete success
+        response.status(200).json({
+          responses: [
+            {
+              id: "368",
+              responseStatus: "ResponseStatus_SUCCESS"
+            }
+          ]
+        });
+      }
+    });
+
+    const result = await page.evaluate(
+      ([url]) => {
+        const { beacon } = window.createBeacon({
+          inMemoryRetry: {
+            attemptLimit: 3,
+            statusCodes: [500, 502, 503], // Note: 200 is not in retry codes, but parseResponseForRetry will handle it
+            calculateRetryDelay: () => 100, // Short delay for testing
+          },
+          parseResponseForRetry: (responseBody, originalPayload) => {
+            try {
+              const response = JSON.parse(responseBody);
+              const originalData = JSON.parse(originalPayload);
+
+              // Find items that need retry based on response status
+              const retryableItemIds = response.responses
+                ?.filter(item => item.responseStatus === "ResponseStatus_RETRYABLE_FAILURE")
+                ?.map(item => item.id) || [];
+
+              if (retryableItemIds.length > 0) {
+                // Get the original items that need retry from originalData
+                const itemsToRetry = originalData.items?.filter(originalItem =>
+                  retryableItemIds.includes(originalItem.id)
+                ) || [];
+
+                if (itemsToRetry.length > 0) {
+                  // Return payload with only the original items that need retry
+                  return JSON.stringify({
+                    items: itemsToRetry
+                  });
+                }
+              }
+
+              return null; // No retry needed
+            } catch (error) {
+              console.error('parseResponseForRetry error:', error);
+              return null;
+            }
+          }
+        });
+
+        // Send initial payload with multiple items
+        return beacon(`${url}/api`, JSON.stringify({
+          items: [
+            { id: "367" },
+            { id: "368" }
+          ]
+        }));
+      },
+      [server.url]
+    );
+
+    // Wait for both requests to complete
+    await waitForExpect(() => {
+      expect(requests.length).toEqual(2);
+    }, 5000);
+
+    // Verify the retry behavior
+    expect(requests).toHaveLength(2);
+
+    // First request should contain both items
+    const firstRequest = JSON.parse(requests[0].body);
+    expect(firstRequest.items).toHaveLength(2);
+    expect(firstRequest.items).toEqual([
+      { id: "367" },
+      { id: "368" }
+    ]);
+
+    // Second request should only contain the retryable item
+    const secondRequest = JSON.parse(requests[1].body);
+    expect(secondRequest.items).toHaveLength(1);
+    expect(secondRequest.items).toEqual([
+      { id: "368" }
+    ]);
+
+    // Final result should be success
+    expect(result.type).toBe('success');
+  });
+
+  it('should retry on 200 response with NON_RETRYABLE_FAILURE status', async () => {
+    const requests = [];
+    let callCount = 0;
+
+    server.post('/api', (request, response) => {
+      callCount++;
+      requests.push({
+        body: request.body,
+        attempt: callCount,
+      });
+
+      if (callCount === 1) {
+        // First call - mixed response with retryable and non-retryable items
+        response.status(200).json({
+          responses: [
+            {
+              id: "367",
+              responseStatus: "ResponseStatus_NON_RETRYABLE_FAILURE" // Should NOT be retried
+            },
+            {
+              id: "368",
+              responseStatus: "ResponseStatus_RETRYABLE_FAILURE" // Should be retried
+            },
+            {
+              id: "369",
+              responseStatus: "ResponseStatus_SUCCESS" // Should NOT be retried
+            }
+          ]
+        });
+      } else {
+        // Second call - success for the retried item
+        response.status(200).json({
+          responses: [
+            {
+              id: "368",
+              responseStatus: "ResponseStatus_SUCCESS"
+            }
+          ]
+        });
+      }
+    });
+
+    const result = await page.evaluate(
+      ([url]) => {
+        const { beacon } = window.createBeacon({
+          inMemoryRetry: {
+            attemptLimit: 2,
+            statusCodes: [500], // 200 not in retry codes, but parseResponseForRetry handles it
+            calculateRetryDelay: () => 50,
+          },
+          parseResponseForRetry: (responseBody, originalPayload) => {
+            try {
+              const response = JSON.parse(responseBody);
+              const originalData = JSON.parse(originalPayload);
+
+              // Only retry items with RETRYABLE_FAILURE status
+              const retryableItems = response.responses?.filter(item =>
+                item.responseStatus === "ResponseStatus_RETRYABLE_FAILURE"
+              ) || [];
+
+              if (retryableItems.length > 0) {
+                // Return payload with only retryable items
+                return JSON.stringify({
+                  id: retryableItems[0].id // For this test, we expect only one item
+                });
+              }
+
+              return null; // No retry needed
+            } catch (error) {
+              return null;
+            }
+          }
+        });
+
+        return beacon(`${url}/api`, JSON.stringify({
+          items: [
+            { id: "367" },
+            { id: "368" },
+            { id: "369" }
+          ]
+        }));
+      },
+      [server.url]
+    );
+
+    // Wait for both requests
+    await waitForExpect(() => {
+      expect(requests.length).toEqual(2);
+    }, 3000);
+
+    expect(requests).toHaveLength(2);
+    expect(result.type).toBe('success');
+
+    // First request should contain all items
+    const firstRequest = JSON.parse(requests[0].body);
+    expect(firstRequest.items).toHaveLength(3);
+    expect(firstRequest.items).toEqual([
+      { id: "367" },
+      { id: "368" },
+      { id: "369" }
+    ]);
+
+    // Second request should only contain the retryable item (368)
+    const secondRequest = JSON.parse(requests[1].body);
+    expect(secondRequest).toEqual({ id: "368" });
+
+    // Verify that NON_RETRYABLE_FAILURE (367) and SUCCESS (369) were NOT retried
+  });
+
+  it('should retry only RETRYABLE_FAILURE items, not NON_RETRYABLE_FAILURE', async () => {
+    const requests = [];
+    let callCount = 0;
+
+    server.post('/api', (request, response) => {
+      callCount++;
+      requests.push({
+        body: request.body,
+        attempt: callCount,
+      });
+
+      if (callCount === 1) {
+        // First call - mixed response with retryable and non-retryable items
+        response.status(200).json({
+          responses: [
+            {
+              id: "367",
+              responseStatus: "ResponseStatus_NON_RETRYABLE_FAILURE" // Should NOT be retried
+            },
+            {
+              id: "368",
+              responseStatus: "ResponseStatus_RETRYABLE_FAILURE" // Should be retried
+            },
+            {
+              id: "369",
+              responseStatus: "ResponseStatus_SUCCESS" // Should NOT be retried
+            }
+          ]
+        });
+      } else {
+        // Second call - success for the retried item
+        response.status(200).json({
+          responses: [
+            {
+              id: "368",
+              responseStatus: "ResponseStatus_SUCCESS"
+            }
+          ]
+        });
+      }
+    });
+
+    const result = await page.evaluate(
+      ([url]) => {
+        const { beacon } = window.createBeacon({
+          inMemoryRetry: {
+            attemptLimit: 2,
+            statusCodes: [500], // 200 not in retry codes, but parseResponseForRetry handles it
+            calculateRetryDelay: () => 50,
+          },
+          parseResponseForRetry: (responseBody, originalPayload) => {
+            try {
+              const response = JSON.parse(responseBody);
+              const originalData = JSON.parse(originalPayload);
+
+              // Only retry items with RETRYABLE_FAILURE status
+              const retryableItems = response.responses?.filter(item =>
+                item.responseStatus === "ResponseStatus_RETRYABLE_FAILURE"
+              ) || [];
+
+              if (retryableItems.length > 0) {
+                // Return payload with only retryable items
+                return JSON.stringify({
+                  id: retryableItems[0].id // For this test, we expect only one item
+                });
+              }
+
+              return null; // No retry needed
+            } catch (error) {
+              return null;
+            }
+          }
+        });
+
+        return beacon(`${url}/api`, JSON.stringify({
+          items: [
+            { id: "367" },
+            { id: "368" },
+            { id: "369" }
+          ]
+        }));
+      },
+      [server.url]
+    );
+
+    // Wait for both requests
+    await waitForExpect(() => {
+      expect(requests.length).toEqual(2);
+    }, 3000);
+
+    expect(requests).toHaveLength(2);
+    expect(result.type).toBe('success');
+
+    // First request should contain all items
+    const firstRequest = JSON.parse(requests[0].body);
+    expect(firstRequest.items).toHaveLength(3);
+    expect(firstRequest.items).toEqual([
+      { id: "367" },
+      { id: "368" },
+      { id: "369" }
+    ]);
+
+    // Second request should only contain the retryable item (368)
+    const secondRequest = JSON.parse(requests[1].body);
+    expect(secondRequest).toEqual({ id: "368" });
+
+    // Verify that NON_RETRYABLE_FAILURE (367) and SUCCESS (369) were NOT retried
   });
 });
 

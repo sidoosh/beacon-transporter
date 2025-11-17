@@ -71,9 +71,12 @@ class Queue implements IQueue {
   }
 
   public onNotify(): void {
+    debug(() => '[IndexedDB Queue] onNotify() called');
     if (this.disablePersistence) {
+      debug(() => '[IndexedDB Queue] Persistence disabled, skipping');
       return;
     }
+    debug(() => '[IndexedDB Queue] Calling throttledFn()');
     this.throttleControl.throttledFn();
   }
 
@@ -133,15 +136,17 @@ class Queue implements IQueue {
       return;
     }
     const runReplayEntriesTask = (): void => {
-      debug(() => 'Replaying entry: shift from store');
+      debug(() => '[IndexedDB Replay] Starting replayEntries task');
       shift<RetryEntry>(1, this.withStore)
         .then((entries) => {
+          debug(() => `[IndexedDB Replay] Retrieved ${entries.length} entries from IndexedDB`);
           if (entries.length > 0) {
             const { url, body, headers, timestamp, statusCode, attemptCount } =
               entries[0];
+            debug(() => `[IndexedDB Replay] Processing entry: ${JSON.stringify({ url, body, timestamp, statusCode, attemptCount })}`);
             debug(
               () =>
-                `header: ${String(
+                `[IndexedDB Replay] header: ${String(
                   this.config.headerName
                 )}; attemptCount: ${attemptCount}`
             );
@@ -161,8 +166,65 @@ class Queue implements IQueue {
                 fetchResult.type === 'unknown' ||
                 fetchResult.type === 'success'
               ) {
+                // Check for partial failures even on successful responses
+                if (this.config.parseResponseForRetry && fetchResult.responseBody) {
+                  debug(() => `[PERSISTENCE] Checking parseResponseForRetry for successful response`);
+                  debug(() => `[PERSISTENCE] Response body: ${fetchResult.responseBody}`);
+                  debug(() => `[PERSISTENCE] Original body: ${body}`);
+                  try {
+                    const retryPayload = this.config.parseResponseForRetry(fetchResult.responseBody, body);
+                    debug(() => `[PERSISTENCE] parseResponseForRetry returned: ${retryPayload}`);
+                    if (retryPayload && retryPayload.trim()) {
+                      // Partial failure detected - re-store with filtered payload
+                      debug(() => `[PERSISTENCE] Partial failure detected, re-storing filtered payload`);
+                      debug(() => `[PERSISTENCE] Current attemptCount: ${attemptCount}, attemptLimit: ${this.config.attemptLimit}`);
+
+                      if (attemptCount + 1 > this.config.attemptLimit) {
+                        debug(() => `[PERSISTENCE] Exceeded attempt count (${attemptCount + 1} > ${this.config.attemptLimit}), dropping entry`);
+                        fetchResult.drop = true;
+                        this.config.onResult?.(fetchResult, body);
+                        debug(() => `[PERSISTENCE] Entry dropped, continuing to process remaining entries`);
+                        // Use throttle mechanism to handle timing properly
+                        this.throttleControl.throttledFn();
+                        return;
+                      }
+
+                      const newEntry = {
+                        url,
+                        body: retryPayload, // Use filtered payload
+                        timestamp,
+                        statusCode,
+                        attemptCount: attemptCount + 1,
+                      };
+                      debug(() => `[PERSISTENCE] Re-storing entry: ${JSON.stringify(newEntry)}`);
+
+                      // Re-store with filtered payload and incremented attempt count
+                      return pushIfNotClearing(
+                        newEntry,
+                        this.config,
+                        this.withStore
+                      ).then(() => {
+                        debug(() => `[PERSISTENCE] Entry re-stored successfully, will be retried when throttle allows`);
+                        // Don't trigger any immediate processing - let natural throttle cycle handle it
+                        // The onNotify() from pushIfNotClearing will be throttled naturally
+                      }).catch((error) => {
+                        debug(() => `[PERSISTENCE] Failed to re-store entry: ${String(error)}`);
+                      });
+                    } else {
+                      debug(() => `[PERSISTENCE] No retry payload returned, treating as complete success`);
+                    }
+                  } catch (error) {
+                    debug(() => `[PERSISTENCE] parseResponseForRetry threw error: ${String(error)}, treating as success`);
+                  }
+                } else {
+                  debug(() => `[PERSISTENCE] No parseResponseForRetry function or no response body`);
+                }
+
+                // Complete success - no partial failures
+                debug(() => `[PERSISTENCE] Complete success, continuing to process remaining entries`);
                 this.config.onResult?.(fetchResult, body);
-                this.replayEntries();
+                // Use throttle mechanism to handle timing properly
+                this.throttleControl.throttledFn();
               } else {
                 if (attemptCount + 1 > this.config.attemptLimit) {
                   debug(
@@ -180,6 +242,9 @@ class Queue implements IQueue {
                   );
                   fetchResult.drop = true;
                   this.config.onResult?.(fetchResult, body);
+                  debug(() => `[PERSISTENCE] Regular retry entry dropped, continuing to process remaining entries`);
+                  // Use throttle mechanism to handle timing properly
+                  this.throttleControl.throttledFn();
                   return;
                 }
                 if (
@@ -218,6 +283,8 @@ class Queue implements IQueue {
                 }
               }
             });
+          } else {
+            debug(() => `[IndexedDB Replay] No more entries in IndexedDB queue`);
           }
         })
         .catch((reason: DOMException) => {

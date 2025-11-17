@@ -29,6 +29,7 @@ export interface BeaconInit<CustomRetryDB = IRetryDBBase> {
     onResult?: (result: RequestResult, rawPayload: string) => void;
   };
   retryDB?: CustomRetryDB;
+  parseResponseForRetry?: (responseBody: string, originalPayload: string) => string | null;
 }
 
 /**
@@ -56,7 +57,9 @@ export type RequiredPersistenceRetryConfig = Required<
     | 'throttleWait'
   >
 > &
-  NonNullable<BeaconInit['persistenceRetry']>;
+  NonNullable<BeaconInit['persistenceRetry']> & {
+    parseResponseForRetry?: (responseBody: string, originalPayload: string) => string | null;
+  };
 
 /**
  * @public
@@ -116,6 +119,7 @@ export interface RequestSuccess {
   type: 'success';
   drop: false;
   statusCode: number;
+  responseBody?: string;
 }
 
 /**
@@ -134,6 +138,7 @@ export interface RequestResponseUnknown {
   type: 'unknown';
   drop: boolean;
   statusCode?: undefined;
+  responseBody?: string;
 }
 
 /**

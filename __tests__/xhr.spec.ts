@@ -27,7 +27,11 @@ self.xhr = xhr;
 `,
 };
 
-describe.each(['chromium', 'webkit', 'firefox'].map((t) => [t]))(
+const browsers = process.env.TEST_CHROME_ONLY
+  ? ['chromium']
+  : ['chromium', 'webkit', 'firefox'];
+
+describe.each(browsers.map((t) => [t]))(
   '[%s] XHR',
   (name) => {
     const browserType: BrowserType<Browser> = playwright[name];

@@ -14,15 +14,39 @@ import { RetryDB } from './queue';
 import { createHeaders, debug, sleep } from './utils';
 
 /**
+ * HTTP Status Code constants
+ */
+const HTTP_STATUS_CODES = {
+  TOO_MANY_REQUESTS: 429,
+  INTERNAL_SERVER_ERROR: 500,
+  BAD_GATEWAY: 502,
+  SERVICE_UNAVAILABLE: 503,
+  GATEWAY_TIMEOUT: 504
+} as const;
+
+/**
+ * Constants for error handling
+ */
+const ERROR_MESSAGES = {
+  PARSE_RESPONSE_RETRY_EXHAUSTED: 'parseResponseForRetry exhausted retries'
+} as const;
+
+/**
  * 502 Bad Gateway
  * 504 Gateway Timeout
  */
-const defaultInMemoryRetryStatusCodes = [502, 504];
+const defaultInMemoryRetryStatusCodes = [
+  HTTP_STATUS_CODES.BAD_GATEWAY,
+  HTTP_STATUS_CODES.GATEWAY_TIMEOUT
+];
 /**
  * 429 Too Many Requests
  * 503 Service Unavailable
  */
-const defaultPersistRetryStatusCodes = [429, 503];
+const defaultPersistRetryStatusCodes = [
+  HTTP_STATUS_CODES.TOO_MANY_REQUESTS,
+  HTTP_STATUS_CODES.SERVICE_UNAVAILABLE
+];
 
 class Beacon<RetryDBType extends IRetryDBBase> {
   private timestamp: number;
@@ -38,7 +62,8 @@ class Beacon<RetryDBType extends IRetryDBBase> {
       disabled: boolean;
       statusCodes: number[];
     },
-    private compress: boolean = false
+    private compress: boolean = false,
+    private parseResponseForRetry?: (responseBody: string, originalPayload: string) => string | null
   ) {
     this.timestamp = Date.now();
     this.onClearCallback = () => (this.isClearQueuePending = true);
@@ -72,57 +97,131 @@ class Beacon<RetryDBType extends IRetryDBBase> {
    * @param fn - The function to retry, should return a promise that rejects with error as retry instruction or resolves if finished
    * @returns result of the retry operation, true if fn ever resolved during retry, false if all retry failed
    */
-  private retry(
+  private async retry(
     fn: (fetchHeaders: Record<string, string>) => ReturnType<typeof fetchFn>,
     retryCountLeft: number,
     headers: Record<string, string>,
     errorCode?: number
   ): Promise<RequestResult> {
-    const attemptCount = this.getAttemptCount(retryCountLeft) - 1;
-    return fn(
-      createHeaders(headers, this.config.headerName, attemptCount, errorCode)
-    ).then((fetchResult) => {
+    let currentRetryCount = retryCountLeft;
+    let currentFn = fn;
+    let currentErrorCode = errorCode;
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const attemptCount = this.getAttemptCount(currentRetryCount) - 1;
+      const fetchResult = await currentFn(
+        createHeaders(headers, this.config.headerName, attemptCount, currentErrorCode)
+      );
+
       fetchResult.drop = false;
-      let result: RequestResult;
+
       if (fetchResult.type === 'unknown' || fetchResult.type === 'success') {
+        // Check for partial failures even on successful responses
+        if (this.parseResponseForRetry && fetchResult.responseBody) {
+          try {
+            const retryPayload = this.parseResponseForRetry(fetchResult.responseBody, this.body);
+            if (retryPayload && retryPayload.trim()) {
+              // Partial failure detected - check if we can retry or should persist
+              debug(() => `[IN-MEMORY] Partial failure detected, retrying with filtered payload`);
+
+              if (currentRetryCount > 0) {
+                // Still have in-memory retries left
+                currentFn = (fetchHeaders: Record<string, string>) => {
+                  return fetchFn(this.url, retryPayload, fetchHeaders, this.compress);
+                };
+                currentErrorCode = fetchResult.statusCode;
+                currentRetryCount--; // Decrement retry count for parseResponseForRetry
+                const waitMs = this.config.calculateRetryDelay(
+                  this.getAttemptCount(currentRetryCount + 1),
+                  currentRetryCount + 1
+                );
+                debug(() => `[IN-MEMORY] parseResponseForRetry in memory retry in ${waitMs}ms`);
+                await sleep(waitMs);
+                continue; // Continue the retry loop
+              } else {
+                // In-memory retries exhausted, check if should persist
+                debug(() => `[IN-MEMORY] parseResponseForRetry retries exhausted, checking persistence`);
+
+                // Create a synthetic error for shouldPersist check
+                const syntheticError: RequestResponseError = {
+                  type: 'response',
+                  drop: true,
+                  statusCode: fetchResult.statusCode as number,
+                  rawError: ERROR_MESSAGES.PARSE_RESPONSE_RETRY_EXHAUSTED
+                };
+
+                if (this.shouldPersist(currentRetryCount, syntheticError)) {
+                  const result: RequestPersisted = {
+                    type: 'persisted',
+                    drop: false,
+                    statusCode: fetchResult.statusCode,
+                  };
+                  this.persistenceConfig.db.pushToQueue({
+                    url: this.url,
+                    body: retryPayload, // Use the filtered payload for persistence
+                    headers,
+                    statusCode: fetchResult.statusCode,
+                    timestamp: this.timestamp,
+                    attemptCount: 0, // Start fresh - persistence has its own attemptLimit
+                  });
+                  this.config.onIntermediateResult?.(result, retryPayload);
+                  return result;
+                } else {
+                  // Can't persist, treat as final failure
+                  fetchResult.drop = true;
+                  this.config.onIntermediateResult?.(fetchResult, this.body);
+                  return fetchResult;
+                }
+              }
+            }
+          } catch (error) {
+            debug(() => `parseResponseForRetry threw error: ${String(error)}, treating as complete success`);
+          }
+        }
+
+        // Complete success - no partial failures
         if (!this.isClearQueuePending && !this.persistenceConfig.disabled) {
           this.persistenceConfig.db.notifyQueue();
         }
-        result = fetchResult;
+        this.config.onIntermediateResult?.(fetchResult, this.body);
+        return fetchResult;
       } else {
         debug(() => 'retry rejected ' + JSON.stringify(fetchResult));
-        if (this.shouldPersist(retryCountLeft, fetchResult)) {
+        if (this.shouldPersist(currentRetryCount, fetchResult)) {
+          const result: RequestPersisted = {
+            type: 'persisted',
+            drop: false,
+            statusCode: fetchResult.statusCode,
+          };
           this.persistenceConfig.db.pushToQueue({
             url: this.url,
             body: this.body,
             headers,
             statusCode: fetchResult.statusCode,
             timestamp: this.timestamp,
-            attemptCount: this.getAttemptCount(retryCountLeft),
+            attemptCount: 0, // Start fresh - persistence has its own attemptLimit
           });
-          result = {
-            type: 'persisted',
-            drop: false,
-            statusCode: fetchResult.statusCode,
-          };
-        } else if (retryCountLeft > 0 && this.isRetryableError(fetchResult)) {
+          this.config.onIntermediateResult?.(result, this.body);
+          return result;
+        } else if (currentRetryCount > 0 && this.isRetryableError(fetchResult)) {
           this.config.onIntermediateResult?.(fetchResult, this.body);
           const waitMs = this.config.calculateRetryDelay(
-            this.getAttemptCount(retryCountLeft),
-            retryCountLeft
+            this.getAttemptCount(currentRetryCount),
+            currentRetryCount
           );
-          debug(() => `in memory retry in ${waitMs}ms`);
-          return sleep(waitMs).then(() =>
-            this.retry(fn, retryCountLeft - 1, headers, fetchResult.statusCode)
-          );
+          debug(() => `[IN-MEMORY] Regular retry in ${waitMs}ms`);
+          await sleep(waitMs);
+          currentRetryCount--;
+          currentErrorCode = fetchResult.statusCode;
+          continue; // Continue the retry loop
         } else {
-          result = fetchResult;
-          result.drop = true;
+          fetchResult.drop = true;
+          this.config.onIntermediateResult?.(fetchResult, this.body);
+          return fetchResult;
         }
       }
-      this.config.onIntermediateResult?.(result, this.body);
-      return result;
-    });
+    }
   }
 
   private isRetryableError(
@@ -148,6 +247,14 @@ class Beacon<RetryDBType extends IRetryDBBase> {
     if (
       !navigator.onLine ||
       (retryCountLeft === 0 && error.type === 'network')
+    ) {
+      return true;
+    }
+    // Handle parseResponseForRetry exhausted retries
+    if (
+      retryCountLeft === 0 &&
+      error.type === 'response' &&
+      error.rawError === ERROR_MESSAGES.PARSE_RESPONSE_RETRY_EXHAUSTED
     ) {
       return true;
     }
@@ -213,6 +320,7 @@ export function createBeacon<CustomRetryDB extends IRetryDBBase = IRetryDBBase>(
     );
     retryDBConfig.headerName =
       retryDBConfig.headerName || inMemoryRetryConfig.headerName;
+    retryDBConfig.parseResponseForRetry = init.parseResponseForRetry;
     retryDB = new RetryDB(retryDBConfig, {
       compress: init.compress,
       disablePersistenceRetry: init.disablePersistenceRetry,
@@ -233,7 +341,8 @@ export function createBeacon<CustomRetryDB extends IRetryDBBase = IRetryDBBase>(
         statusCodes:
           init.persistenceRetry?.statusCodes || defaultPersistRetryStatusCodes,
       },
-      compress
+      compress,
+      init.parseResponseForRetry
     ).send(headers);
   };
   return { beacon, database: retryDB };

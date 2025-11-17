@@ -53,6 +53,83 @@ export function xhr(
   }
 }
 
+/**
+ * Determines if content type indicates JSON format
+ */
+function isJsonContentType(contentType: string): boolean {
+  const normalizedType = contentType.toLowerCase().trim();
+  return normalizedType.includes('application/json') ||
+    normalizedType.includes('+json') ||
+    normalizedType.includes('text/json');
+}
+
+/**
+ * Extracts and processes response body with defensive parsing
+ */
+async function extractResponseBody(response: Response): Promise<string> {
+  try {
+    const contentType = response.headers.get('content-type') || '';
+
+    if (isJsonContentType(contentType)) {
+      const jsonData = await response.json() as unknown;
+      return JSON.stringify(jsonData);
+    }
+    return await response.text();
+  } catch (error) {
+    return '';
+  }
+}
+
+/**
+ * Handles successful response processing
+ */
+async function handleSuccessResponse(response: Response): Promise<RequestSuccess> {
+  const responseBody = await extractResponseBody(response);
+  return {
+    type: 'success',
+    drop: false,
+    statusCode: response.status,
+    responseBody,
+  };
+}
+
+/**
+ * Handles error response processing
+ */
+async function handleErrorResponse(response: Response): Promise<RequestResponseError> {
+  let errorMessage = response.statusText;
+
+  // Try to extract error details from response body
+  try {
+    const errorBody = await extractResponseBody(response);
+    if (errorBody) {
+      errorMessage = `${response.statusText}: ${errorBody}`;
+    }
+  } catch (error) {
+    // Use serializeError for consistent error handling
+    const serializedError = serializeError(error);
+    errorMessage = `${response.statusText}: ${serializedError}`;
+  }
+
+  return {
+    type: 'response',
+    drop: true,
+    statusCode: response.status,
+    rawError: errorMessage,
+  };
+}
+
+/**
+ * Handles network error processing
+ */
+function handleNetworkError(error: unknown): RequestNetworkError {
+  return {
+    type: 'network',
+    drop: true,
+    rawError: serializeError(error),
+  };
+}
+
 function createRequestInit({
   body,
   keepalive,
@@ -104,28 +181,14 @@ function keepaliveFetch(
         );
       })
       .then(
-        (response) => {
+        async (response) => {
           if (response.ok) {
-            resolve({
-              type: 'success',
-              drop: false,
-              statusCode: response.status,
-            });
+            resolve(await handleSuccessResponse(response));
           } else {
-            resolve({
-              type: 'response',
-              drop: true,
-              statusCode: response.status,
-              rawError: response.statusText,
-            });
+            resolve(await handleErrorResponse(response));
           }
         },
-        (error: unknown) =>
-          resolve({
-            type: 'network',
-            drop: true,
-            rawError: serializeError(error),
-          })
+        (error: unknown) => resolve(handleNetworkError(error))
       );
   });
 }
@@ -174,28 +237,14 @@ function fallbackFetch(
       url,
       createRequestInit({ body, keepalive: false, headers, compress })
     ).then(
-      (response) => {
+      async (response) => {
         if (response.ok) {
-          resolve({
-            type: 'success',
-            drop: false,
-            statusCode: 200,
-          });
+          resolve(await handleSuccessResponse(response));
         } else {
-          resolve({
-            type: 'response',
-            drop: true,
-            statusCode: response.status,
-            rawError: response.statusText,
-          });
+          resolve(await handleErrorResponse(response));
         }
       },
-      (error: unknown) =>
-        resolve({
-          type: 'network',
-          drop: true,
-          rawError: serializeError(error),
-        })
+      (error: unknown) => resolve(handleNetworkError(error))
     );
   });
 }
