@@ -163,7 +163,7 @@ class Beacon<RetryDBType extends IRetryDBBase> {
                     headers,
                     statusCode: fetchResult.statusCode,
                     timestamp: this.timestamp,
-                    attemptCount: 0, // Start fresh - persistence has its own attemptLimit
+                    attemptCount: 1, // Start from 1 - first persistence attempt
                   });
                   this.config.onIntermediateResult?.(result, retryPayload);
                   return result;
@@ -200,7 +200,7 @@ class Beacon<RetryDBType extends IRetryDBBase> {
             headers,
             statusCode: fetchResult.statusCode,
             timestamp: this.timestamp,
-            attemptCount: 0, // Start fresh - persistence has its own attemptLimit
+            attemptCount: 1, // Start from 1 - first persistence attempt
           });
           this.config.onIntermediateResult?.(result, this.body);
           return result;

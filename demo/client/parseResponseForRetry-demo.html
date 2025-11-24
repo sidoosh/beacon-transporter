@@ -61,9 +61,32 @@
     <button id="test-exhaust-retry" class="error">Test Exhaust Retries (IndexedDB)</button>
     <button id="test-success-on-third" class="retry">Test Success on 3rd Persistence</button>
     <button id="test-direct-persist" class="warning">Test Direct to IndexedDB (No In-Memory)</button>
+    <button id="test-headers" class="retry">🏷️ Test Headers (502 Retry)</button>
+    <button id="test-headers-persist" class="warning">🏷️ Test Headers (500 Persist)</button>
+    <button id="test-counter-behavior" class="retry">🔢 Test Counter Behavior (500→RETRYABLE_FAILURE)</button>
+    <button id="test-simple-scenario" class="retry">🎯 Simple Scenario (500→RETRYABLE_FAILURE→SUCCESS)</button>
+    <button id="reset-simple-scenario" class="warning">🔄 Reset Simple Scenario Counter</button>
     <button id="clear-logs">Clear Logs</button>
     <button id="clear-db">Clear IndexedDB</button>
     <button id="reset-server">Reset Server Counters</button>
+
+    <div style="margin: 20px 0; padding: 15px; background: #e7f3ff; border-left: 4px solid #007bff;">
+        <h3>🏷️ Header Testing</h3>
+        <p>Custom headers to send with requests:</p>
+        <div style="margin: 10px 0;">
+            <label>Authorization: </label>
+            <input type="text" id="auth-header" value="Bearer demo-token-123" style="width: 200px; padding: 5px;">
+        </div>
+        <div style="margin: 10px 0;">
+            <label>X-Request-ID: </label>
+            <input type="text" id="request-id" value="" style="width: 200px; padding: 5px;">
+            <button onclick="document.getElementById('request-id').value = 'req_' + Date.now()">Generate</button>
+        </div>
+        <div style="margin: 10px 0;">
+            <label>X-Custom-Header: </label>
+            <input type="text" id="custom-header" value="custom-value-123" style="width: 200px; padding: 5px;">
+        </div>
+    </div>
 
     <div id="logs"></div>
 
@@ -73,6 +96,18 @@
 
         window.__DEBUG_BEACON_TRANSPORTER = true;
         console.log('Debug flag set:', window.__DEBUG_BEACON_TRANSPORTER);
+        console.log('Window object exists:', typeof window !== 'undefined');
+        console.log('Debug flag accessible:', window.__DEBUG_BEACON_TRANSPORTER);
+
+        // Debug function is internal - no need to import it
+
+        // Also set on globalThis and self for compatibility
+        if (typeof globalThis !== 'undefined') {
+            globalThis.__DEBUG_BEACON_TRANSPORTER = true;
+        }
+        if (typeof self !== 'undefined') {
+            self.__DEBUG_BEACON_TRANSPORTER = true;
+        }
 
         const logs = document.getElementById('logs');
 
@@ -88,9 +123,10 @@
         console.log('Creating beacon...');
         const { beacon, database } = createBeacon({
             inMemoryRetry: {
-                attemptLimit: 2, // Reduce to 2 so we can test exhaustion faster
-                statusCodes: [502, 503], // Keep 500 out for direct IndexedDB
-                calculateRetryDelay: () => 500, // Faster retry for demo
+                attemptLimit: 0, // Disable in-memory retry completely
+                statusCodes: [502, 503], // Not used since attemptLimit is 0
+                calculateRetryDelay: () => 500, // Not used since attemptLimit is 0
+                headerName: 'x-retry-context', // Add header for retry metadata
             },
             persistenceRetry: {
                 idbName: 'parseResponseForRetry-demo',
@@ -100,6 +136,16 @@
                 throttleWait: 10000, // 10 seconds for retry
                 useIdle: false, // Don't wait for idle time - retry immediately
                 statusCodes: [429, 500, 503], // Add 500 to trigger IndexedDB storage
+                headerName: 'x-retry-context', // Add header for retry metadata
+                onBeforeRetry: (rawPayload) => {
+                    log(`🔄 [PERSISTENCE] About to retry: ${rawPayload.substring(0, 100)}...`);
+                },
+                onResult: (result, rawPayload) => {
+                    log(`📊 [PERSISTENCE] Final result: ${result.type}, drop: ${result.drop}, status: ${result.statusCode || 'N/A'}`);
+                    if (result.drop) {
+                        log(`🗑️ [PERSISTENCE] Entry dropped - should be removed from IndexedDB`);
+                    }
+                }
             },
             parseResponseForRetry: (responseBody, originalPayload) => {
                 try {
@@ -314,7 +360,8 @@
             await resetServerCounters();
             requestCount = 0;
             log('🚀 Starting Exhaust Retries Test (will exhaust in-memory then use IndexedDB)...');
-            log('💡 This will fail 3 times in-memory, then store in IndexedDB for later retry');
+            log('💡 Expected: 2 in-memory retries → store in IndexedDB → 3 persistence retries → drop');
+            log('🔧 Config: inMemory.attemptLimit=2, persistence.attemptLimit=3');
 
             try {
                 const result = await beacon('/api/exhaust-retry', JSON.stringify({
@@ -323,7 +370,15 @@
                         { id: "item2", data: "retry_data_2", timestamp: Date.now() }
                     ]
                 }));
-                log(`✅ Final result: ${JSON.stringify(result)}`);
+
+                log(`✅ Immediate result: ${JSON.stringify(result)}`);
+
+                if (result.drop === false && result.type === 'persisted') {
+                    log(`💾 Entry stored in IndexedDB - watch for background retries every 10 seconds`);
+                    log(`🔍 Expected: 3 persistence attempts (1,2,3) then entry should be dropped`);
+                } else {
+                    log(`⚠️ Unexpected result - entry not persisted as expected`);
+                }
             } catch (error) {
                 log(`🚨 Error: ${error.message}`);
             }
@@ -405,9 +460,170 @@
             await resetServerCounters();
         });
 
+        // Header testing functions
+        function getCustomHeaders() {
+            const headers = {};
+
+            const auth = document.getElementById('auth-header').value.trim();
+            if (auth) headers['Authorization'] = auth;
+
+            const requestId = document.getElementById('request-id').value.trim();
+            if (requestId) headers['X-Request-ID'] = requestId;
+
+            const custom = document.getElementById('custom-header').value.trim();
+            if (custom) headers['X-Custom-Header'] = custom;
+
+            return headers;
+        }
+
+        // Test headers with in-memory retry (502)
+        document.getElementById('test-headers').addEventListener('click', async () => {
+            const headers = getCustomHeaders();
+            log('🏷️ Testing Headers with In-Memory Retry (502)');
+            log(`📤 Custom headers: ${JSON.stringify(headers)}`);
+            log('🔄 This will trigger in-memory retries with header preservation');
+
+            try {
+                const result = await beacon('/api/header-test/502', JSON.stringify({
+                    test: 'header-test-502',
+                    timestamp: Date.now(),
+                    headers: Object.keys(headers)
+                }), headers);
+
+                log(`✅ Header test result: ${JSON.stringify(result)}`);
+                log('🔍 Check server logs to see received headers with retry context');
+            } catch (error) {
+                log(`🚨 Header test error: ${error.message}`);
+            }
+        });
+
+        // Test headers with persistent retry (500)
+        document.getElementById('test-headers-persist').addEventListener('click', async () => {
+            const headers = getCustomHeaders();
+            log('🏷️ Testing Headers with Persistent Retry (500)');
+            log(`📤 Custom headers: ${JSON.stringify(headers)}`);
+            log('💾 This will store headers in IndexedDB and restore during retry');
+
+            try {
+                const result = await beacon('/api/header-test/500', JSON.stringify({
+                    test: 'header-test-500',
+                    timestamp: Date.now(),
+                    headers: Object.keys(headers)
+                }), headers);
+
+                log(`✅ Header persist test result: ${JSON.stringify(result)}`);
+                log('🔍 Headers should be preserved in IndexedDB and restored during replay');
+
+                if (result.drop) {
+                    log('💾 ✅ Request with headers stored in IndexedDB!');
+                    log('⏰ Watch for retry with preserved headers in server logs');
+                }
+            } catch (error) {
+                log(`🚨 Header persist test error: ${error.message}`);
+            }
+        });
+
+        // Test counter behavior: 500 errors then RETRYABLE_FAILURE
+        document.getElementById('test-counter-behavior').addEventListener('click', async () => {
+            // Reset ONLY the counter-behavior-test endpoint counter
+            try {
+                await fetch('/api/reset-counter-behavior', { method: 'POST' });
+                log('🔄 Reset counter-behavior-test endpoint counter only');
+            } catch (error) {
+                log(`⚠️ Failed to reset counter: ${error.message}`);
+            }
+
+            requestCount = 0;
+            log('🔢 Starting Counter Behavior Test...');
+            log('📋 Simplified scenario (no in-memory retry):');
+            log('   Request 1: 500 error → Direct to persistence (attemptCount: 1)');
+            log('   Request 2: 200 RETRYABLE_FAILURE → Persistence retry (attemptCount: 2) ← KEY TEST');
+            log('   Request 3: 200 SUCCESS → Final attempt (attemptCount: 3)');
+            log('🔧 Config: inMemory.attemptLimit=0 (DISABLED), persistence.attemptLimit=3');
+            log('🔧 In-memory retry: COMPLETELY DISABLED');
+            log('🔧 Persistence status codes: [429, 500, 503]');
+
+            try {
+                const result = await beacon('/api/counter-behavior-test', JSON.stringify({
+                    items: [
+                        { id: "counter1", data: "test_counter_behavior", timestamp: Date.now() },
+                        { id: "counter2", data: "test_counter_behavior", timestamp: Date.now() }
+                    ]
+                }));
+
+                log(`✅ Initial result: ${JSON.stringify(result)}`);
+
+                if (result.drop === false && result.type === 'persisted') {
+                    log(`💾 Entry stored in IndexedDB after in-memory exhaustion`);
+                    log(`🔍 Watch for the complete retry sequence:`);
+                    log(`   - In-memory 1: 500 error → retry in 500ms`);
+                    log(`   - In-memory 2: 500 error → exhausted, go to persistence`);
+                    log(`   - Persistence 1: 500 error → attemptCount: 1`);
+                    log(`   - Persistence 2: RETRYABLE_FAILURE → attemptCount: 2 (NOT reset!)`);
+                    log(`   - Persistence 3: SUCCESS → attemptCount: 3`);
+                    log(`⏰ Each persistence attempt waits 10 seconds due to throttle`);
+                } else {
+                    log(`⚠️ Unexpected result - entry not persisted as expected`);
+                }
+            } catch (error) {
+                log(`🚨 Error: ${error.message}`);
+            }
+        });
+
+        // Simple scenario test: 500 → RETRYABLE_FAILURE → SUCCESS
+        document.getElementById('test-simple-scenario').addEventListener('click', async () => {
+            // DON'T reset counter - we need continuous sequence across retries
+            requestCount = 0;
+            log('🎯 Starting Simple Scenario Test...');
+            log('📋 Expected sequence:');
+            log('   Call 1: 500 error → Direct to persistence (attemptCount: 1)');
+            log('   Call 2: 200 RETRYABLE_FAILURE → Persistence retry (attemptCount: 2) ← KEY TEST');
+            log('   Call 3: 200 SUCCESS → Final attempt (attemptCount: 3)');
+            log('🔧 This tests if counter continues: 1 → 2 → 3 (not reset)');
+
+            try {
+                const result = await beacon('/api/simple-scenario', JSON.stringify({
+                    items: [
+                        { id: "item1", data: "simple_test_data", timestamp: Date.now() },
+                        { id: "item2", data: "simple_test_data", timestamp: Date.now() }
+                    ]
+                }));
+
+                log(`✅ Initial result: ${JSON.stringify(result)}`);
+
+                if (result.drop === false && result.type === 'persisted') {
+                    log(`💾 Entry stored in IndexedDB after 500 error`);
+                    log(`🔍 Watch server logs for:`);
+                    log(`   - Call 2: attemptCount should be 1`);
+                    log(`   - Call 3: attemptCount should be 2 (NOT reset to 1!)`);
+                    log(`⏰ Persistence retries happen every 10 seconds`);
+                } else {
+                    log(`⚠️ Unexpected result: ${JSON.stringify(result)}`);
+                }
+            } catch (error) {
+                log(`🚨 Error: ${error.message}`);
+            }
+        });
+
+        // Manual reset for simple scenario
+        document.getElementById('reset-simple-scenario').addEventListener('click', async () => {
+            try {
+                await fetch('/api/reset-simple-scenario', { method: 'POST' });
+                log('🔄 Simple scenario counter reset - ready for fresh test');
+            } catch (error) {
+                log(`⚠️ Failed to reset simple scenario counter: ${error.message}`);
+            }
+        });
+
+        // Initialize request ID
+        document.getElementById('request-id').value = 'req_' + Date.now();
+
         log('📋 Demo ready! Click the buttons to test different scenarios.');
         log('💡 Use "Test Server Error" to see IndexedDB persistence in action!');
         log('🎯 Try "Test Success on 3rd Persistence" to see the full retry cycle!');
+        log('🏷️ NEW: Use header test buttons to verify header preservation!');
+        log('🔢 NEW: Use "Counter Behavior" test to verify attempt counter continuation!');
+        log('🎯 NEW: Use "Simple Scenario" test for clean 500→RETRYABLE_FAILURE→SUCCESS flow!');
         log('🔍 Check DevTools > Application > IndexedDB to see the database.');
     </script>
 </body>

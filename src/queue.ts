@@ -179,33 +179,35 @@ class Queue implements IQueue {
                       debug(() => `[PERSISTENCE] Partial failure detected, re-storing filtered payload`);
                       debug(() => `[PERSISTENCE] Current attemptCount: ${attemptCount}, attemptLimit: ${this.config.attemptLimit}`);
 
-                      if (attemptCount + 1 > this.config.attemptLimit) {
-                        debug(() => `[PERSISTENCE] Exceeded attempt count (${attemptCount + 1} > ${this.config.attemptLimit}), dropping entry`);
+                      if (attemptCount >= this.config.attemptLimit) {
+                        debug(() => `[PERSISTENCE] Exceeded attempt count (${attemptCount} >= ${this.config.attemptLimit}), dropping entry`);
                         fetchResult.drop = true;
                         this.config.onResult?.(fetchResult, body);
                         debug(() => `[PERSISTENCE] Entry dropped, continuing to process remaining entries`);
-                        // Use throttle mechanism to handle timing properly
-                        this.throttleControl.throttledFn();
+                        // Continue processing remaining entries immediately
+                        this.replayEntries();
                         return;
                       }
 
+                      // Re-store with filtered payload and incremented attempt count
+                      // Use original timestamp to maintain entry identity and prevent duplicates
                       const newEntry = {
                         url,
                         body: retryPayload, // Use filtered payload
-                        timestamp,
-                        statusCode,
+                        headers,
+                        statusCode: fetchResult.statusCode, // Update to actual response status
+                        timestamp, // Keep original timestamp to prevent duplicates
                         attemptCount: attemptCount + 1,
                       };
-                      debug(() => `[PERSISTENCE] Re-storing entry: ${JSON.stringify(newEntry)}`);
+                      debug(() => `[PERSISTENCE] Re-storing entry with same timestamp: ${JSON.stringify(newEntry)}`);
 
-                      // Re-store with filtered payload and incremented attempt count
                       return pushIfNotClearing(
                         newEntry,
                         this.config,
                         this.withStore
                       ).then(() => {
                         debug(() => `[PERSISTENCE] Entry re-stored successfully, will be retried when throttle allows`);
-                        // Don't trigger any immediate processing - let natural throttle cycle handle it
+                        // Don't trigger immediate processing - let natural throttle cycle handle it
                         // The onNotify() from pushIfNotClearing will be throttled naturally
                       }).catch((error) => {
                         debug(() => `[PERSISTENCE] Failed to re-store entry: ${String(error)}`);
@@ -223,10 +225,10 @@ class Queue implements IQueue {
                 // Complete success - no partial failures
                 debug(() => `[PERSISTENCE] Complete success, continuing to process remaining entries`);
                 this.config.onResult?.(fetchResult, body);
-                // Use throttle mechanism to handle timing properly
-                this.throttleControl.throttledFn();
+                // Continue processing remaining entries immediately
+                this.replayEntries();
               } else {
-                if (attemptCount + 1 > this.config.attemptLimit) {
+                if (attemptCount >= this.config.attemptLimit) {
                   debug(
                     () =>
                       'Exceeded attempt count, dropping the entry: ' +
@@ -243,8 +245,8 @@ class Queue implements IQueue {
                   fetchResult.drop = true;
                   this.config.onResult?.(fetchResult, body);
                   debug(() => `[PERSISTENCE] Regular retry entry dropped, continuing to process remaining entries`);
-                  // Use throttle mechanism to handle timing properly
-                  this.throttleControl.throttledFn();
+                  // Continue processing remaining entries immediately
+                  this.replayEntries();
                   return;
                 }
                 if (
